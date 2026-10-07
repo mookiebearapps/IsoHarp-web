@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Isomorphic Harp</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            background-color: #000;
+            color: #fff;
+            margin: 0;
+            padding: 0;
+            overflow: hidden; /* Prevent scrolling */
+            touch-action: none; /* Critical for multi-touch drag */
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }
+
+        #top-bar {
+            height: 50px;
+            background-color: #1a1a1a;
+            display: flex;
+            align-items: center;
+            padding: 0 16px;
+            border-bottom: 1px solid #333;
+            flex-shrink: 0;
+        }
+
+        select {
+            background-color: #333;
+            color: white;
+            border: 1px solid #555;
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 16px;
+            outline: none;
+            cursor: pointer;
+        }
+
+        #fullscreen-btn {
+            background-color: #333;
+            color: white;
+            border: 1px solid #555;
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 14px;
+            margin-left: 12px;
+            cursor: pointer;
+            outline: none;
+            transition: background-color 0.2s;
+        }
+        
+        #fullscreen-btn:hover {
+            background-color: #444;
+        }
+
+        #harp-grid {
+            display: grid;
+            grid-template-columns: repeat(8, 1fr);
+            grid-template-rows: repeat(11, 1fr);
+            gap: 2px;
+            flex-grow: 1;
+            padding: 4px;
+            background-color: #000;
+        }
+
+        .key {
+            border-radius: 4px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-size: 0.75rem;
+            font-weight: 600;
+            user-select: none;
+            -webkit-user-select: none;
+            cursor: pointer;
+            transition: filter 0.1s, transform 0.05s;
+            box-sizing: border-box;
+            border: 1px solid rgba(0,0,0,0.2);
+        }
+
+        .key.active {
+            filter: brightness(1.5);
+            transform: scale(0.95);
+            box-shadow: inset 0 0 10px rgba(255,255,255,0.4);
+        }
+    </style>
+</head>
+<body>
+    <div id="top-bar">
+        <select id="instrument-select">
+            <option value="organ">Organ</option>
+            <option value="sine">Sine Wave</option>
+            <option value="triangle">Triangle Wave</option>
+            <option value="flute">Flute</option>
+            <option value="square">Square Wave</option>
+            <option value="piano">Piano</option>
+            <option value="xylophone">Xylophone</option>
+            <option value="strings">Strings</option>
+            <option value="warmpad">Warm Pad</option>
+        </select>
+        <button id="fullscreen-btn">Fullscreen</button>
+        <div class="ml-auto text-xs text-gray-400">
+            Slide fingers across grid
+        </div>
+    </div>
+    <div id="harp-grid"></div>
+
+    <script>
+        const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+        const ROWS = 11;
+        const COLS = 8;
+        
+        let audioCtx = null;
+        const activeVoices = {}; 
+        const touchMap = {};     
+        let isMouseDown = false;
+        
+        const gridEl = document.getElementById('harp-grid');
+        const instrumentSelect = document.getElementById('instrument-select');
+        const fullscreenBtn = document.getElementById('fullscreen-btn');
+
+        fullscreenBtn.addEventListener('click', () => {
+            if (!document.fullscreenElement) {
+                document.documentElement.requestFullscreen().catch(err => {
+                    console.log(`Error attempting to enable fullscreen: ${err.message}`);
+                });
+            } else {
+                if (document.exitFullscreen) {
+                    document.exitFullscreen();
+                }
+            }
+        });
+
+        document.addEventListener('fullscreenchange', () => {
+            if (document.fullscreenElement) {
+                fullscreenBtn.textContent = 'Exit Fullscreen';
+            } else {
+                fullscreenBtn.textContent = 'Fullscreen';
+            }
+        });
+
+        // Pitch Class Colors (0 = C, 11 = B)
+        const COLORS = {
+            0: { bg: '#e52b20', text: '#fff' }, // C: Red
+            1: { bg: '#333333', text: '#fff' }, // C#: Dark Grey
+            2: { bg: '#f07f7f', text: '#000' }, // D: Light Red/Pink
+            3: { bg: '#333333', text: '#fff' }, // D#: Dark Grey
+            4: { bg: '#ff9900', text: '#000' }, // E: Orange
+            5: { bg: '#ffee00', text: '#000' }, // F: Yellow
+            6: { bg: '#333333', text: '#fff' }, // F#: Dark Grey
+            7: { bg: '#00e5e5', text: '#000' }, // G: Cyan
+            8: { bg: '#333333', text: '#fff' }, // G#: Dark Grey
+            9: { bg: '#00cc00', text: '#000' }, // A: Green
+            10: { bg: '#333333', text: '#fff' }, // A#: Dark Grey
+            11: { bg: '#1a1aff', text: '#fff' }  // B: Blue
+        };
+
+        function initAudio() {
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            if (audioCtx.state === 'suspended') {
+                audioCtx.resume();
+            }
+        }
+
+        function midiToFreq(midi) {
+            return 440 * Math.pow(2, (midi - 69) / 12);
+        }
+
+        function playNote(midiNote, colIndex) {
+            initAudio();
+            const freq = midiToFreq(midiNote);
+            const instrument = instrumentSelect.value;
+            
+            const masterGain = audioCtx.createGain();
+            // Critical fix: Initialize value to 0 synchronously to avoid the default 1.0 value causing a pop
+            masterGain.gain.value = 0; 
+            
+            const panner = audioCtx.createStereoPanner();
+            // Map column index (0 to COLS-1) to pan value (-1.0 to +1.0)
+            const panValue = (colIndex / (COLS - 1)) * 2 - 1;
+            panner.pan.value = panValue;
+            
+            masterGain.connect(panner);
+            panner.connect(audioCtx.destination);
+            
+            let oscillators = [];
+            let stopFunction = null;
+            let autoStopTime = null;
+
+            if (instrument === 'organ') {
+                const osc1 = audioCtx.createOscillator();
+                osc1.type = 'sine';
+                osc1.frequency.value = freq;
+                
+                const osc2 = audioCtx.createOscillator();
+                osc2.type = 'triangle';
+                osc2.frequency.value = freq * 2; 
+                
+                osc1.connect(masterGain);
+                osc2.connect(masterGain);
+                oscillators.push(osc1, osc2);
+                
+                // Fetch time strictly before scheduling
+                const time = audioCtx.currentTime;
+                masterGain.gain.setValueAtTime(0, time);
+                masterGain.gain.linearRampToValueAtTime(0.3, time + 0.02);
+                
+                stopFunction = () => {
+                    const t = audioCtx.currentTime;
+                    masterGain.gain.cancelScheduledValues(t);
+                    masterGain.gain.setValueAtTime(masterGain.gain.value, t);
+                    masterGain.gain.linearRampToValueAtTime(0, t + 0.05);
+                    osc1.stop(t + 0.1);
+                    osc2.stop(t + 0.1);
+                };
+            } 
+            else if (instrument === 'sine' || instrument === 'triangle') {
+                const osc = audioCtx.createOscillator();
+                osc.type = instrument;
+                osc.frequency.value = freq;
+                
+                osc.connect(masterGain);
+                oscillators.push(osc);
+                
+                const time = audioCtx.currentTime;
+                masterGain.gain.setValueAtTime(0, time);
+                masterGain.gain.linearRampToValueAtTime(0.4, time + 0.02);
+                
+                stopFunction = () => {
+                    const t = audioCtx.currentTime;
+                    masterGain.gain.cancelScheduledValues(t);
+                    masterGain.gain.setValueAtTime(masterGain.gain.value, t);
+                    masterGain.gain.setTargetAtTime(0, t, 0.05);
+                    osc.stop(t + 0.5);
+                };
+            }
+            else if (instrument === 'flute') {
+                const osc = audioCtx.createOscillator();
+                osc.type = 'sine';
+                osc.frequency.value = freq;
+                
+                osc.connect(masterGain);
+                oscillators.push(osc);
+                
+                const time = audioCtx.currentTime;
+                masterGain.gain.setValueAtTime(0, time);
+                masterGain.gain.linearRampToValueAtTime(0.5, time + 0.15); 
+                
+                stopFunction = () => {
+                    const t = audioCtx.currentTime;
+                    masterGain.gain.cancelScheduledValues(t);
+                    masterGain.gain.setValueAtTime(masterGain.gain.value, t);
+                    masterGain.gain.setTargetAtTime(0, t, 0.1); 
+                    osc.stop(t + 0.5);
+                };
+            }
+            else if (instrument === 'square') {
+                const osc = audioCtx.createOscillator();
+                osc.type = 'square';
+                osc.frequency.value = freq;
+                
+                const filter = audioCtx.createBiquadFilter();
+                filter.type = 'lowpass';
+                filter.frequency.value = 2500;
+                
+                osc.connect(filter);
+                filter.connect(masterGain);
+                oscillators.push(osc);
+                
+                const time = audioCtx.currentTime;
+                masterGain.gain.setValueAtTime(0, time);
+                masterGain.gain.linearRampToValueAtTime(0.15, time + 0.02);
+                
+                stopFunction = () => {
+                    const t = audioCtx.currentTime;
+                    masterGain.gain.cancelScheduledValues(t);
+                    masterGain.gain.setValueAtTime(masterGain.gain.value, t);
+                    masterGain.gain.setTargetAtTime(0, t, 0.05);
+                    osc.stop(t + 0.2);
+                };
+            }
+            else if (instrument === 'piano') {
+                const osc1 = audioCtx.createOscillator();
+                osc1.type = 'triangle';
+                osc1.frequency.value = freq;
+                
+                const osc2 = audioCtx.createOscillator();
+                osc2.type = 'sawtooth';
+                osc2.frequency.value = freq * 1.002;
+                
+                const filter = audioCtx.createBiquadFilter();
+                filter.type = 'lowpass';
+                
+                osc1.connect(filter);
+                osc2.connect(filter);
+                filter.connect(masterGain);
+                oscillators.push(osc1, osc2);
+                
+                const time = audioCtx.currentTime;
+                filter.frequency.setValueAtTime(4000, time);
+                filter.frequency.setTargetAtTime(freq * 1.5, time + 0.015, 0.1); 
+                
+                masterGain.gain.setValueAtTime(0, time); 
+                masterGain.gain.linearRampToValueAtTime(0.5, time + 0.015); 
+                masterGain.gain.setTargetAtTime(0, time + 0.015, 0.5); 
+                
+                autoStopTime = time + 3.0;
+                
+                stopFunction = () => {
+                    const t = audioCtx.currentTime;
+                    masterGain.gain.cancelScheduledValues(t);
+                    masterGain.gain.setValueAtTime(masterGain.gain.value, t);
+                    masterGain.gain.setTargetAtTime(0, t, 0.05);
+                    osc1.stop(t + 0.5);
+                    osc2.stop(t + 0.5);
+                };
+            }
+            else if (instrument === 'strings') {
+                const osc1 = audioCtx.createOscillator();
+                osc1.type = 'sawtooth';
+                osc1.frequency.value = freq;
+                
+                const osc2 = audioCtx.createOscillator();
+                osc2.type = 'sawtooth';
+                osc2.frequency.value = freq * 0.995;
+                
+                const filter = audioCtx.createBiquadFilter();
+                filter.type = 'lowpass';
+                filter.frequency.value = Math.max(freq * 3, 1000);
+                
+                osc1.connect(filter);
+                osc2.connect(filter);
+                filter.connect(masterGain);
+                oscillators.push(osc1, osc2);
+                
+                const time = audioCtx.currentTime;
+                masterGain.gain.setValueAtTime(0, time);
+                masterGain.gain.linearRampToValueAtTime(0.25, time + 0.2); 
+                
+                stopFunction = () => {
+                    const t = audioCtx.currentTime;
+                    masterGain.gain.cancelScheduledValues(t);
+                    masterGain.gain.setValueAtTime(masterGain.gain.value, t);
+                    masterGain.gain.setTargetAtTime(0, t, 0.2); 
+                    osc1.stop(t + 1.0);
+                    osc2.stop(t + 1.0);
+                };
+            }
+            else if (instrument === 'xylophone') {
+                const osc1 = audioCtx.createOscillator();
+                osc1.type = 'sine';
+                osc1.frequency.value = freq;
+                
+                const osc2 = audioCtx.createOscillator();
+                osc2.type = 'triangle';
+                osc2.frequency.value = freq * 3.0; 
+                
+                osc1.connect(masterGain);
+                osc2.connect(masterGain);
+                oscillators.push(osc1, osc2);
+                
+                const time = audioCtx.currentTime;
+                masterGain.gain.setValueAtTime(0, time);
+                masterGain.gain.linearRampToValueAtTime(0.8, time + 0.005); 
+                masterGain.gain.setTargetAtTime(0, time + 0.005, 0.1);
+                
+                autoStopTime = time + 1.0; 
+                
+                stopFunction = () => {
+                    const t = audioCtx.currentTime;
+                    masterGain.gain.cancelScheduledValues(t);
+                    masterGain.gain.setValueAtTime(masterGain.gain.value, t);
+                    masterGain.gain.setTargetAtTime(0, t, 0.02);
+                    osc1.stop(t + 0.2);
+                    osc2.stop(t + 0.2);
+                };
+            }
+            else if (instrument === 'warmpad') {
+                const osc1 = audioCtx.createOscillator();
+                osc1.type = 'sawtooth';
+                osc1.frequency.value = freq;
+                
+                const osc2 = audioCtx.createOscillator();
+                osc2.type = 'sawtooth';
+                osc2.frequency.value = freq * 0.992;
+                
+                const osc3 = audioCtx.createOscillator();
+                osc3.type = 'sawtooth';
+                osc3.frequency.value = freq * 1.008;
+                
+                const filter = audioCtx.createBiquadFilter();
+                filter.type = 'lowpass';
+                filter.frequency.value = 750;
+                
+                osc1.connect(filter);
+                osc2.connect(filter);
+                osc3.connect(filter);
+                filter.connect(masterGain);
+                oscillators.push(osc1, osc2, osc3);
+                
+                const time = audioCtx.currentTime;
+                masterGain.gain.setValueAtTime(0, time);
+                masterGain.gain.linearRampToValueAtTime(0.2, time + 0.5); 
+                
+                stopFunction = () => {
+                    const t = audioCtx.currentTime;
+                    masterGain.gain.cancelScheduledValues(t);
+                    masterGain.gain.setValueAtTime(masterGain.gain.value, t);
+                    masterGain.gain.setTargetAtTime(0, t, 0.4); 
+                    osc1.stop(t + 2.0);
+                    osc2.stop(t + 2.0);
+                    osc3.stop(t + 2.0);
+                };
+            }
+
+            // Start all oscillators exactly at the scheduling time
+            const startTime = audioCtx.currentTime;
+            oscillators.forEach(o => {
+                o.start(startTime);
+                if (autoStopTime) o.stop(autoStopTime);
+            });
+
+            return {
+                stop: stopFunction || (() => {})
+            };
+        }
+
+        function createGrid() {
+            for (let row = 0; row < ROWS; row++) {
+                for (let col = 0; col < COLS; col++) {
+                    // Formula: Bottom-left is C3 (MIDI 48). 
+                    const midiNote = 48 + (10 - row) + (col * 2);
+                    
+                    const octave = Math.floor(midiNote / 12) - 1;
+                    const pitchClass = midiNote % 12;
+                    const noteName = NOTE_NAMES[pitchClass] + octave;
+                    const colorData = COLORS[pitchClass];
+
+                    const key = document.createElement('div');
+                    key.className = 'key';
+                    key.textContent = noteName;
+                    key.dataset.midi = midiNote;
+                    key.dataset.col = col;
+                    key.style.backgroundColor = colorData.bg;
+                    key.style.color = colorData.text;
+                    
+                    gridEl.appendChild(key);
+                }
+            }
+        }
+
+        function triggerKeyOn(key, id) {
+            if (!key || !key.dataset.midi) return;
+            key.classList.add('active');
+            const midi = parseInt(key.dataset.midi);
+            const col = parseInt(key.dataset.col);
+            const voice = playNote(midi, col);
+            activeVoices[id] = voice;
+            touchMap[id] = key;
+        }
+
+        function triggerKeyOff(id) {
+            if (activeVoices[id]) {
+                activeVoices[id].stop();
+                delete activeVoices[id];
+            }
+            if (touchMap[id]) {
+                touchMap[id].classList.remove('active');
+                delete touchMap[id];
+            }
+        }
+
+        // Multi-touch Events
+        gridEl.addEventListener('touchstart', (e) => {
+            e.preventDefault(); // Stop scroll/zoom
+            initAudio();
+            for (let i = 0; i < e.changedTouches.length; i++) {
+                const touch = e.changedTouches[i];
+                const target = document.elementFromPoint(touch.clientX, touch.clientY);
+                if (target && target.classList.contains('key')) {
+                    triggerKeyOn(target, touch.identifier);
+                }
+            }
+        }, { passive: false });
+
+        gridEl.addEventListener('touchmove', (e) => {
+            e.preventDefault();
+            for (let i = 0; i < e.changedTouches.length; i++) {
+                const touch = e.changedTouches[i];
+                const target = document.elementFromPoint(touch.clientX, touch.clientY);
+                
+                const id = touch.identifier;
+                const currentKey = touchMap[id];
+                
+                if (target && target.classList.contains('key')) {
+                    if (target !== currentKey) {
+                        triggerKeyOff(id); // Release old key
+                        triggerKeyOn(target, id); // Press new key
+                    }
+                } else if (currentKey) {
+                    // Slid off the grid entirely
+                    triggerKeyOff(id);
+                }
+            }
+        }, { passive: false });
+
+        const endTouch = (e) => {
+            e.preventDefault();
+            for (let i = 0; i < e.changedTouches.length; i++) {
+                triggerKeyOff(e.changedTouches[i].identifier);
+            }
+        };
+
+        gridEl.addEventListener('touchend', endTouch, { passive: false });
+        gridEl.addEventListener('touchcancel', endTouch, { passive: false });
+
+        gridEl.addEventListener('mousedown', (e) => {
+            isMouseDown = true;
+            initAudio();
+            if (e.target.classList.contains('key')) {
+                triggerKeyOn(e.target, 'mouse');
+            }
+        });
+
+        gridEl.addEventListener('mouseover', (e) => {
+            if (isMouseDown && e.target.classList.contains('key')) {
+                const currentKey = touchMap['mouse'];
+                if (currentKey !== e.target) {
+                    triggerKeyOff('mouse');
+                    triggerKeyOn(e.target, 'mouse');
+                }
+            }
+        });
+
+        window.addEventListener('mouseup', () => {
+            isMouseDown = false;
+            triggerKeyOff('mouse');
+        });
+        
+        // Prevent context menu on long press
+        window.addEventListener('contextmenu', e => e.preventDefault());
+
+        // Initialize App
+        createGrid();
+    </script>
+</body>
+</html>
